@@ -1,5 +1,5 @@
 /**********************************************************************
-  Smart Bin board: Freenove ESP32-S3 WROOM + camera + HC-SR04 hand sensor.
+  Smart Bin board: Freenove ESP32-S3 WROOM + camera + HC-SR04 hand sensor + buzzer.
   No WiFi and no web server: the board talks to the Smart Bin app (app.py)
   over the USB cable, so keep it plugged into the laptop.
 
@@ -17,6 +17,9 @@
   The board understands (one command per line):
     scan                  take a photo now and send it (the app's Scan button)
     near 30               change the photo distance, in cm (0 = no automatic photos)
+    beep                  sound the buzzer once (BEEP_MS). The app sends this when a scanned item
+                          belongs in a different bin from the one picked on its Sorted Garbage screen.
+  After a photo the board waits 2 seconds before it takes another one (PHOTO_GAP_MS).
 **********************************************************************/
 #include "esp_camera.h"
 
@@ -28,6 +31,21 @@
 #define TRIG_PIN 21
 #define ECHO_PIN 47
 int nearCm = 30;  // take a photo when something comes this close (cm). The app can change it.
+
+// Buzzer (MH-FMD active buzzer, low-trigger). Wiring: GND -> GPIO 42, VCC -> GPIO 41, I/O -> GPIO 14.
+// The board powers it from two pins: GPIO 42 held LOW is its ground, GPIO 41 held HIGH its power.
+#define BUZZER_IO_PIN 14  // LOW = beep, HIGH = quiet
+#define BUZZER_GND_PIN 42
+#define BUZZER_VCC_PIN 41
+#define BEEP_MS 500  // how long one beep lasts
+uint32_t beepStartedAt = 0;
+bool beeping = false;
+
+// After a photo the board waits this long before it takes another one, whatever sets it off
+#define PHOTO_GAP_MS 2000
+uint32_t lastPhotoAt = 0;
+bool photoTaken = false;
+bool scanWanted = false;  // the app asked for a photo and it has not been taken yet
 
 // Camera pins on the Freenove ESP32-S3 WROOM board ("ESP32S3_EYE" in the camera examples)
 #define XCLK_GPIO_NUM 15
@@ -154,9 +172,16 @@ void sendPhoto(const char *why) {
     sendAll((const uint8_t *)line, strlen(line));
     return;
   }
-  snprintf(line, sizeof(line), "\nPHOTO %s %u %lu\n", why, (unsigned)len, (unsigned long)(millis() - started));
+  lastPhotoAt = millis();  // the gap before the next photo starts here
+  photoTaken = true;
+  snprintf(line, sizeof(line), "\nPHOTO %s %u %lu\n", why, (unsigned)len, (unsigned long)(lastPhotoAt - started));
   if (sendAll((const uint8_t *)line, strlen(line)) && sendAll(jpg, len)) sendAll((const uint8_t *)"\n", 1);
   free(jpg);
+}
+
+// True once the gap after the last photo is over (or no photo has been taken yet)
+bool gapOver() {
+  return !photoTaken || millis() - lastPhotoAt >= PHOTO_GAP_MS;
 }
 
 // One HC-SR04 measurement in cm, or -1 if no echo came back (same method as sensor_test.ino)
@@ -171,6 +196,14 @@ float measureCm() {
 }
 
 void setup() {
+  // Buzzer in this order, so it does not chirp at start-up: I/O HIGH (quiet) first, then its ground, then its power
+  pinMode(BUZZER_IO_PIN, OUTPUT);
+  digitalWrite(BUZZER_IO_PIN, HIGH);
+  pinMode(BUZZER_GND_PIN, OUTPUT);
+  digitalWrite(BUZZER_GND_PIN, LOW);
+  pinMode(BUZZER_VCC_PIN, OUTPUT);
+  digitalWrite(BUZZER_VCC_PIN, HIGH);
+
   Serial.setTxBufferSize(2048);  // USB buffer big enough for a photo to leave in a few large pieces
   Serial.begin(115200);
   pinMode(TRIG_PIN, OUTPUT);
@@ -192,9 +225,11 @@ void loop() {
 
   // Something has come close: take one photo and send it. No second photo until it has moved away
   // again (5 cm past the photo distance, so a hand hovering right at the limit cannot fire twice).
+  // If it comes close during the gap after the last photo, the photo is taken when the gap ends,
+  // provided it is still there. A photo the app is waiting for goes first.
   static bool armed = true;
   if (middle > nearCm + 5) armed = true;
-  if (armed && nearCm > 0 && middle <= nearCm) {
+  if (armed && nearCm > 0 && middle <= nearCm && gapOver() && !scanWanted) {
     armed = false;
     if (Serial.availableForWrite() > 1024) sendPhoto("hand");  // a full buffer means the app is not running
   }
@@ -215,11 +250,28 @@ void loop() {
     if (ch == '\n' || ch == '\r') {
       command[commandLen] = 0;
       commandLen = 0;
-      if (strcmp(command, "scan") == 0) sendPhoto("scan");
+      if (strcmp(command, "scan") == 0) scanWanted = true;
       else if (strncmp(command, "near ", 5) == 0) nearCm = constrain(atoi(command + 5), 0, 400);
+      else if (strcmp(command, "beep") == 0) {
+        digitalWrite(BUZZER_IO_PIN, LOW);  // sound on; it goes off by itself after BEEP_MS (below)
+        beepStartedAt = millis();
+        beeping = true;
+      }
     } else if (commandLen < sizeof(command) - 1) {
       command[commandLen++] = ch;
     }
+  }
+
+  // The photo the app asked for: at once, or as soon as the gap after the last photo is over
+  if (scanWanted && gapOver()) {
+    scanWanted = false;
+    sendPhoto("scan");
+  }
+
+  // A beep ends by itself once it has lasted BEEP_MS
+  if (beeping && millis() - beepStartedAt >= BEEP_MS) {
+    digitalWrite(BUZZER_IO_PIN, HIGH);
+    beeping = false;
   }
   delay(60);
 }

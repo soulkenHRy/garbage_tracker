@@ -3,6 +3,8 @@
 The camera board (an ESP32-S3 with a camera and a hand sensor) stays plugged into this laptop by USB.
 When a hand comes close, the board takes a photo and sends it over the cable. This app asks Google
 Gemini which bin the item belongs in, shows the answer on a web page and saves every scan in scans.db.
+On the page's Sorted Garbage screen you pick which bin this is; when a scanned item belongs in another
+bin, the app tells the board to beep.
 
 Run it:  press F5 in VS Code  (or: venv/bin/python app.py). The page opens by itself.
 The Gemini API key is read from the GEMINI_API_KEY environment variable; a .env file works too.
@@ -134,6 +136,12 @@ def auto_scan():
     return {"on": setting("auto_on", "1") == "1", "cm": int(setting("auto_cm", AUTO_SCAN_CM))}
 
 
+def this_bin():
+    """The bin picked on the Sorted Garbage screen ("blue", "green" or "black"), or "" when none is picked."""
+    picked = setting("this_bin", "")
+    return picked if picked in BINS else ""
+
+
 # ---- Camera board (USB) -----------------------------------------------------
 def data_url(jpeg):
     """The photo in the form a web page can show directly."""
@@ -248,13 +256,16 @@ class Board:
             self.hand = (self.hand[0] + 1, time.time(), jpeg)
 
     def send(self, command):
+        """Send the board one command line. True when it went out."""
         port = self.port
         if port is not None:
             with self.send_lock:
                 try:
                     port.write(command.encode() + b"\n")
+                    return True
                 except (serial.SerialException, OSError):
                     pass  # the reading thread notices a lost board and reconnects
+        return False
 
     def photo(self):
         """A photo taken right now, as JPEG bytes. Used by the Scan button."""
@@ -357,7 +368,7 @@ def index():
 
 @app.get("/api/state")
 def api_state():
-    return jsonify(stats=get_stats(), history=recent_scans(), auto=auto_scan())
+    return jsonify(stats=get_stats(), history=recent_scans(), auto=auto_scan(), this_bin=this_bin())
 
 
 @app.post("/api/snap")
@@ -384,6 +395,11 @@ def api_scan():
         return jsonify(error="A scan is already running.", kind="busy"), 409
     try:
         result = classify(jpeg)
+        here = this_bin()
+        if here and result["bin"] != here:  # Sorted Garbage: the item belongs in another bin, so the board beeps
+            sent = board.send("beep")
+            print(f"Wrong bin: {result['item']} goes in the {result['bin']} bin, and this is the {here} bin. "
+                  + ("Beep sent to the board." if sent else "The board is not connected, so no beep."), flush=True)
         ts = datetime.now().isoformat(timespec="seconds")
         scan_id = execute(
             "INSERT INTO scans (ts, bin, item, reason, photo) VALUES (?, ?, ?, ?, ?)",
@@ -426,6 +442,16 @@ def api_auto():
     save_setting("auto_on", "1" if data.get("on") else "0")
     save_setting("auto_cm", cm)
     return jsonify(auto=auto_scan())
+
+
+@app.post("/api/this-bin")
+def api_this_bin():
+    """Sorted Garbage screen: save which bin this is ("blue", "green" or "black"; "" for none)."""
+    picked = (request.get_json(silent=True) or {}).get("bin") or ""
+    if picked != "" and picked not in BINS:
+        return jsonify(error="Pick the blue, green or black bin."), 400
+    save_setting("this_bin", picked)
+    return jsonify(this_bin=this_bin())
 
 
 @app.get("/photo/<int:scan_id>")
@@ -494,6 +520,9 @@ PAGE = r"""<!doctype html>
   .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--axis); flex: none; }
   [data-state="on"] > .dot { background: var(--good); }
   [data-state="off"] > .dot { background: none; box-shadow: inset 0 0 0 2.5px var(--bad); }
+  .top-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+  .swatch { width: 12px; height: 16px; border-radius: 3px; flex: none; box-shadow: inset 0 0 0 2px var(--axis); }
+  .swatch.set { box-shadow: none; }
 
   /* Layout */
   .card { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 20px; }
@@ -608,6 +637,27 @@ PAGE = r"""<!doctype html>
   .dlg-msg { min-height: 1.45em; margin-top: 14px; font-weight: 600; }
   .help { margin-top: 10px; padding-top: 14px; border-top: 1px solid var(--line); color: var(--ink-2); font-size: .92rem; }
 
+  /* Sorted Garbage screen: which bin this is */
+  .sorted { padding: clamp(20px, 4vw, 36px); }
+  .sorted .link { margin-bottom: 12px; }
+  .sorted h2 { font-size: clamp(1.7rem, 3.6vw, 2.4rem); font-weight: 800; letter-spacing: -0.03em; }
+  .sorted-lead { margin-top: 6px; max-width: 62ch; color: var(--ink-2); font-size: 1.05rem; }
+  .sort-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; margin-top: 26px; }
+  .sort-btn { position: relative; display: flex; flex-direction: column; justify-content: flex-end; gap: 6px; min-height: 190px;
+              padding: 22px; border: 0; border-radius: 14px; color: #fff; text-align: left; transition: box-shadow .15s; }
+  .sort-btn[data-bin="green"] { background: var(--green); }
+  .sort-btn[data-bin="black"] { background: var(--black); }
+  .sort-btn[data-bin="blue"] { background: var(--blue); }
+  .sort-btn:hover { filter: brightness(1.12); }
+  .sort-btn:active { transform: translateY(1px); }
+  .sort-name { font-size: clamp(2rem, 4vw, 2.7rem); line-height: 1; font-weight: 800; letter-spacing: -0.03em; }
+  .sort-kind { font-size: 1.05rem; font-weight: 600; }
+  .sort-btn[aria-pressed="true"] { box-shadow: 0 0 0 4px var(--surface), 0 0 0 8px var(--accent); }
+  .sort-btn[aria-pressed="true"]::after { content: "✓ This bin"; position: absolute; top: 14px; right: 14px; padding: 4px 10px;
+                                          border-radius: 999px; background: var(--accent); color: var(--ink); font-size: .85rem; font-weight: 800; }
+  .sort-state { min-height: 1.45em; margin-top: 24px; font-size: 1.05rem; font-weight: 600; }
+  @media (max-width: 700px) { .sort-grid { grid-template-columns: minmax(0, 1fr); } .sort-btn { min-height: 120px; } }
+
   @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
 </style>
 </head>
@@ -619,12 +669,17 @@ PAGE = r"""<!doctype html>
       <h1>Smart Bin</h1>
       <span class="tag">Toronto waste sorter</span>
     </div>
-    <button id="camBtn" class="cam" type="button" aria-haspopup="dialog" title="Camera board">
-      <span class="dot" aria-hidden="true"></span><span id="camText">Checking camera…</span><small id="camAddrLabel"></small>
-    </button>
+    <div class="top-actions">
+      <button id="sortBtn" class="cam" type="button" title="Sorted Garbage: pick which bin this is">
+        <i class="swatch" id="sortSwatch" aria-hidden="true"></i><span>Sorted Garbage</span><small id="sortLabel">Off</small>
+      </button>
+      <button id="camBtn" class="cam" type="button" aria-haspopup="dialog" title="Camera board">
+        <span class="dot" aria-hidden="true"></span><span id="camText">Checking camera…</span><small id="camAddrLabel"></small>
+      </button>
+    </div>
   </header>
 
-  <main>
+  <main id="scanScreen">
     <div class="stage">
       <section class="card" aria-label="Camera">
         <div class="photo" id="photoBox">
@@ -661,6 +716,20 @@ PAGE = r"""<!doctype html>
         <ol class="history" id="history"></ol>
       </section>
     </div>
+  </main>
+
+  <main id="sortedScreen" hidden>
+    <section class="card sorted" aria-labelledby="sortedTitle">
+      <button id="sortedBack" class="link" type="button">← Back to scanning</button>
+      <h2 id="sortedTitle">Sorted Garbage</h2>
+      <p class="sorted-lead">Pick which bin this is. When Gemini says a scanned item belongs in a different bin, the board beeps.</p>
+      <div class="sort-grid" role="group" aria-label="Which bin this is">
+        <button class="sort-btn" type="button" data-bin="green" aria-pressed="false"><span class="sort-name">Organic</span><span class="sort-kind">Green bin</span></button>
+        <button class="sort-btn" type="button" data-bin="black" aria-pressed="false"><span class="sort-name">Waste</span><span class="sort-kind">Black bin · Garbage</span></button>
+        <button class="sort-btn" type="button" data-bin="blue" aria-pressed="false"><span class="sort-name">Recycle</span><span class="sort-kind">Blue bin</span></button>
+      </div>
+      <p class="sort-state" id="sortState" role="status"></p>
+    </section>
   </main>
 </div>
 
@@ -758,6 +827,7 @@ function showError(e, photo) {
 async function scan(photo) {
   if (busy) return;
   busy = true;
+  showScreen("scan");   // a scan always shows its photo and answer on the main screen
   const box = $("photoBox"), headline = el("p", { class: "headline" });
   const say = (eyebrow, text) => { headline.textContent = text; setVerdict(null, el("p", { class: "eyebrow", text: eyebrow }), headline); };
   $("scanBtn").disabled = true; $("scanText").textContent = "Scanning…"; box.classList.add("busy");
@@ -881,16 +951,56 @@ async function saveAuto() {
 $("autoOn").onchange = saveAuto;
 $("autoCm").onchange = saveAuto;
 
+// ---- Sorted Garbage screen: which bin this is ----
+// The app compares every scan with this choice and makes the board beep when the item belongs in another bin.
+// The hand sensor keeps scanning while this screen is open; a scan switches back to the main screen.
+const SORT = {
+  green: { name: "Organic", bin: "green bin" },
+  black: { name: "Waste",   bin: "black bin" },
+  blue:  { name: "Recycle", bin: "blue bin" },
+};
+let thisBin = "";
+function renderSorted(problem) {
+  const pick = SORT[thisBin];
+  $("sortLabel").textContent = pick ? pick.name : "Off";
+  $("sortSwatch").classList.toggle("set", !!pick);
+  $("sortSwatch").style.background = pick ? `var(--${thisBin})` : "";
+  $("sortedScreen").classList.toggle("picked", !!pick);
+  for (const b of document.querySelectorAll(".sort-btn")) b.setAttribute("aria-pressed", String(b.dataset.bin === thisBin));
+  $("sortState").textContent = problem || (pick
+    ? `This is the ${pick.name} bin (${pick.bin}). The board beeps when a scanned item belongs in another bin. Tap ${pick.name} again to stop the beeps.`
+    : "No bin picked yet, so the board does not beep.");
+}
+function showScreen(name) {
+  const sorted = name === "sorted";
+  if (sorted === !$("sortedScreen").hidden) return;
+  $("sortedScreen").hidden = !sorted; $("scanScreen").hidden = sorted; $("sortBtn").hidden = sorted;
+  if (sorted) $("sortedBack").focus();
+  else if (document.activeElement) document.activeElement.blur();   // so Space scans again
+}
+$("sortBtn").onclick = () => showScreen("sorted");
+$("sortedBack").onclick = () => showScreen("scan");
+for (const b of document.querySelectorAll(".sort-btn")) {
+  b.onclick = async () => {
+    const bin = b.dataset.bin === thisBin ? "" : b.dataset.bin;   // the picked bin tapped again: no more beeps
+    try { thisBin = (await api("/api/this-bin", { bin })).this_bin; renderSorted(); }
+    catch (e) { renderSorted("Could not save that choice. " + e.message); }
+  };
+}
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && !$("sortedScreen").hidden && !$("camDialog").open) showScreen("scan");
+});
+
 // ---- Start ----
 $("scanBtn").onclick = scan;
-document.addEventListener("keydown", e => {   // Space scans, unless you are typing or already on a button
+document.addEventListener("keydown", e => {   // Space scans, unless you are typing, already on a button or on the Sorted Garbage screen
   const tag = document.activeElement ? document.activeElement.tagName : "";
-  if (e.code !== "Space" || e.repeat || $("camDialog").open || ["INPUT", "BUTTON", "TEXTAREA", "SELECT"].includes(tag)) return;
+  if (e.code !== "Space" || e.repeat || $("camDialog").open || !$("sortedScreen").hidden || ["INPUT", "BUTTON", "TEXTAREA", "SELECT"].includes(tag)) return;
   e.preventDefault(); scan();
 });
-showIdle(); setCam(null);
+showIdle(); setCam(null); renderSorted();
 api("/api/state").then(d => {
-  renderStats(d.stats); renderHistory(d.history); auto = d.auto;
+  renderStats(d.stats); renderHistory(d.history); auto = d.auto; thisBin = d.this_bin || ""; renderSorted();
 }).catch(showError).finally(() => { showAuto(); watchSensor(); });
 </script>
 </body>
